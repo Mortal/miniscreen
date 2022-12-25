@@ -37,6 +37,7 @@ class MiniScreen:
         # Enable autowrap
         self._stdout.write("\x1b[?7h")
         # Disable bracketed paste
+        # See also: http://www.xfree86.org/4.7.0/ctlseqs.html
         self._stdout.write("\x1b[?2004l")
         self._stdout.flush()
 
