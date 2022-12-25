@@ -115,6 +115,8 @@ class MiniScreen:
         self._move_up(len(self._screen_lines))
         i = 0
         for line in lines:
+            if i == 0:
+                self._stdout.write("\r")
             if i == len(self._screen_lines):
                 self._stdout.write("\x1b[1L")
                 self._stdout.write("%s\r\n" % line)
@@ -127,8 +129,7 @@ class MiniScreen:
         if i < len(self._screen_lines):
             self._stdout.write("\r\x1b[%sM" % (len(self._screen_lines) - i))
             del self._screen_lines[i:]
-        if self._screen_lines and self._screen_lines[-1]:
-            self._stdout.write("\r")
+        self._stdout.write("\r\x1b[K")
         self._stdout.write(self._linebuf)
         if self._cursor != len(self._linebuf):
             self._stdout.write("\x1b[%sD" % (len(self._linebuf) - self._cursor))
