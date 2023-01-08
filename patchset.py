@@ -1,14 +1,31 @@
 import argparse
+import asyncio
 import collections
 import datetime
 import subprocess
 from typing import TypedDict
 
 from miniscreen import MiniScreen, read_one_keystroke
+from miniscreen.futures import next_keystroke
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("revision_range")
+
+
+async def check_output(cmdline: tuple[str, ...], *, input: bytes | None = None) -> bytes:
+    proc = await asyncio.create_subprocess_exec(
+        *cmdline,
+        stdin=None if input is None else subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    stdout_data, stderr_data = await proc.communicate(input)
+    assert stdout_data is not None
+    assert stderr_data is None
+    r = await proc.wait()
+    if r:
+        raise subprocess.CalledProcessError(r, cmdline, stdout_data, stderr_data)
+    return stdout_data
 
 
 class Commit(TypedDict):
@@ -24,8 +41,8 @@ class Commit(TypedDict):
     body: str
 
 
-def git_cat_file(sha: str) -> tuple[str, bytes]:
-    d = subprocess.check_output("git cat-file --batch", input=sha.encode(), shell=True)
+async def git_cat_file(sha: str) -> tuple[str, bytes]:
+    d = await check_output(("git", "cat-file", "--batch"), input=sha.encode())
     first_line, nl, rest = d.partition(b"\n")
     assert nl
     oid, type, size_str = first_line.decode().split()
@@ -49,8 +66,8 @@ def parse_name_email_date(name_email_date: bytes) -> tuple[str, str, str]:
     return name, email, dt
 
 
-def git_get_commit(sha: str) -> Commit:
-    type, data = git_cat_file(sha)
+async def git_get_commit(sha: str) -> Commit:
+    type, data = await git_cat_file(sha)
     headers_b, sep_b, message_b = data.partition(b"\n\n")
     assert sep_b
     parents: list[str] = []
@@ -98,9 +115,9 @@ class Blame(TypedDict):
     filelines: dict[str, list[LineSource]]
 
 
-def sha_has_filename(sha: str, filename: str) -> bool:
+async def sha_has_filename(sha: str, filename: str) -> bool:
     try:
-        subprocess.check_output(
+        await check_output(
             ("git", "rev-parse", "--quiet", "--verify", f"{sha}:{filename}")
         )
     except subprocess.CalledProcessError:
@@ -108,8 +125,8 @@ def sha_has_filename(sha: str, filename: str) -> bool:
     return True
 
 
-def git_show_numstat(sha: str) -> dict[str, DiffStat]:
-    numstat = subprocess.check_output(
+async def git_show_numstat(sha: str) -> dict[str, DiffStat]:
+    numstat = await check_output(
         ("git", "show", "--format=", "--numstat", sha),
     )
     filediffstat: dict[str, DiffStat] = {}
@@ -122,17 +139,19 @@ def git_show_numstat(sha: str) -> dict[str, DiffStat]:
     return filediffstat
 
 
-def git_blame(sha: str, filename: str) -> list[tuple[LineSource, bytes]]:
-    if not sha_has_filename(sha, filename):
+async def git_blame(sha: str, filename: str) -> list[tuple[LineSource, bytes]]:
+    if not (await sha_has_filename(sha, filename)):
         return []
-    blame_b = subprocess.check_output(
+    blame_b = await check_output(
         ("git", "blame", "--porcelain", sha, "--", filename),
     )
+    if not blame_b.strip(b"\n"):
+        return []
     blame_output_lines = iter(blame_b.strip(b"\n").split(b"\n"))
     lines: list[tuple[LineSource, bytes]] = []
     linedata_for_sha: dict[bytes, dict[bytes, bytes]] = {}
     for lineno, headerline in enumerate(blame_output_lines, 1):
-        assert headerline.count(b" ") >= 2
+        assert headerline.count(b" ") >= 2, headerline
         blamesha, blameline, finalline, *_ignore = headerline.split(b" ", 3)
         linedata: dict[bytes, bytes] = {}
         for extraline in blame_output_lines:
@@ -169,34 +188,17 @@ def sum_diffstats(filediffstat: dict[str, DiffStat]) -> DiffStat:
     return totaladded, totalremoved
 
 
-def compute_blame_data(sha: str) -> Blame:
-    filediffstat = git_show_numstat(sha)
-    totaldiffstat = sum_diffstats(filediffstat)
-
-    filelines: dict[str, list[LineSource]] = {}
-    for filename, (added, removed) in filediffstat.items():
-        lines = git_blame(sha, filename)
-        filelines[filename] = [
-            line_source
-            for line_source, contents in lines
-            # Skip if line only contains delimiters and whitespace
-            if contents.strip(b" \t\n\r<>(){}[],;")
-        ]
-    return {
-        "totaldiffstat": (totaladded, totalremoved),
-        "filediffstat": filediffstat,
-        "filelines": filelines,
-    }
-
-
 def main() -> None:
     args = parser.parse_args()
-    objects = subprocess.check_output(
-        "git rev-list --stdin",
-        input=args.revision_range,
-        shell=True,
-        universal_newlines=True,
-    ).split()[::-1]
+    asyncio.run(async_main(args.revision_range))
+
+
+async def async_main(revision_range: str) -> None:
+    rev_list_output = await check_output(
+        ("git", "rev-list", "--stdin"),
+        input=revision_range.encode(),
+    )
+    objects = rev_list_output.decode().split()[::-1]
     filediffstats: dict[str, dict[str, DiffStat]] = {}
     file_to_commits: dict[str, list[str]] = {}
     # [sha1][file][sha2] is a set of line numbers of sha1:file
@@ -208,13 +210,28 @@ def main() -> None:
     commit_lines_remove: dict[str, dict[str, dict[int, str | None]]] = {
         o: {} for o in objects
     }
+    # [sha1][file] is the list of sha2 that the deleted lines are added in
+    commit_lines_removed: dict[str, dict[str, list[str]]] = {
+        o: {} for o in objects
+    }
     commitlistheight = 30
     commits: dict[str, Commit] = {}
     file_blames: dict[str, list[tuple[str, list[tuple[LineSource, bytes]]]]] = {}
     current = len(objects) - 1, 0
     shalen = 10
     with MiniScreen() as ms:
-        while True:
+
+        screen_dirty = True
+
+        def maybe_rerender() -> None:
+            nonlocal screen_dirty
+            if screen_dirty:
+                render()
+
+        def render():
+            nonlocal screen_dirty
+
+            screen_dirty = False
             lines = []
             for i in range(commitlistheight):
                 object_index = current[0] - commitlistheight + 1 + i
@@ -222,30 +239,148 @@ def main() -> None:
                     lines.append("")
                     continue
                 sha = objects[object_index]
-                try:
-                    c = commits[sha]
-                except KeyError:
-                    ms.set_line(f'git log -1 {sha}')
-                    c = commits[sha] = git_get_commit(sha)
-                    ms.set_line("")
                 star = "*" if object_index == current[0] else " "
-                lines.append(f'{star} {sha[:shalen]} {c["subject"]}')
+                if sha in commits:
+                    c = commits[sha]
+                    lines.append(f'{star} {sha[:shalen]} {c["subject"]}')
+                else:
+                    screen_dirty = True
+                    lines.append(f'{star} {sha[:shalen]}')
 
-            sha = objects[current[0]]
-            c = commits[sha]
             indent = "  " + " " * shalen
+            sha = objects[current[0]]
+            try:
+                c = commits[sha]
+            except KeyError:
+                commitline = ""
+                blamedesc = ""
+                removedesc = f"{indent} Loading commit"
+                screen_dirty = True
+                ms.set_window(lines + [commitline, blamedesc, "", removedesc])
+                return
             commitline = f'{indent} {c["author_name"]} {c["author_date"]}'
             blamedesc = ""
             removedesc = f"{indent} Loading blame"
             if sha not in filediffstats:
-                ms.set_window(lines + [commitline, blamedesc, removedesc])
-            while sha not in filediffstats:
+                ms.set_window(lines + [commitline, blamedesc, "", removedesc])
+                screen_dirty = True
+                return
+            if current[1] == 0:
+                added, removed = sum_diffstats(filediffstats[sha])
+                if len(filediffstats[sha]) == 1:
+                    currentfilename, = filediffstats[sha].keys()
+                    filedesc = f"1 file: {currentfilename}"
+                else:
+                    filedesc = f'{len(filediffstats[sha])} files'
+                blamedesc = f'{indent} {added} lines added, {removed} lines removed in {filedesc}'
+                removestats = collections.Counter(
+                    commit_lines_remove[sha][file][line]
+                    for file in commit_lines_remove[sha]
+                    for line in commit_lines_remove[sha][file]
+                )
+                removedstats = collections.Counter(
+                    sha2
+                    for file in commit_lines_removed[sha]
+                    for sha2 in commit_lines_removed[sha][file]
+                )
+            else:
+                currentfilename, (added, removed) = list(filediffstats[sha].items())[
+                    current[1] - 1
+                ]
+                blamedesc = f'{indent} {added} lines added, {removed} lines removed in {currentfilename}'
+                removestats = collections.Counter(
+                    commit_lines_remove[sha][currentfilename][line]
+                    for line in commit_lines_remove[sha][currentfilename]
+                )
+                removedstats = collections.Counter(
+                    sha2
+                    for sha2 in commit_lines_removed[sha].get(currentfilename, [])
+                )
+            if not removedstats and not removed:
+                removeddesc = f'{indent} No lines deleted'
+            elif not removedstats:
+                removeddesc = f"{indent} No interesting lines deleted from this patchset"
+            else:
+                maxremoved = max(removedstats.keys(), key=lambda k: removedstats[k])
+                totalremove = sum(removedstats.values())
+                if removedstats[maxremoved] == totalremove:
+                    pct = "All lines"
+                elif totalremove > 200:
+                    pct = f'{removedstats[maxremoved]/totalremove:.1%} of lines'
+                else:
+                    pct = f'{removedstats[maxremoved]} of {totalremove} lines'
+                assert maxremoved is not None
+                removeddesc = f'{indent} {pct} removed are from commit {maxremoved[:shalen]}'
+                try:
+                    removedcommit = commits[maxremoved]
+                except KeyError:
+                    if maxremoved in objects:
+                        screen_dirty = True
+                    else:
+                        removeddesc = f'{indent} {pct} removed are from an old commit ({maxremoved[:shalen]})'
+                else:
+                    removeddesc += f' {removedcommit["subject"]}'
+            if not removestats and not added:
+                removedesc = f'{indent} No lines added'
+            elif not removestats:
+                removedesc = f"{indent} No interesting lines added"
+            else:
+                maxremove = max(removestats.keys(), key=lambda k: (k is not None, removestats[k]))
+                totalremove = sum(removestats.values())
+                if removestats[maxremove] == totalremove:
+                    pct = "All lines"
+                elif totalremove > 200:
+                    pct = f'{removestats[maxremove]/totalremove:.1%} of lines'
+                else:
+                    pct = f'{removestats[maxremove]} of {totalremove} lines'
+                if maxremove is None:
+                    removedesc = f'{indent} {pct} are still alive'
+                else:
+                    removedesc = f'{indent} {pct} are removed in commit {maxremove[:shalen]}'
+                    try:
+                        removecommit = commits[maxremove]
+                    except KeyError:
+                        screen_dirty = True
+                    else:
+                        removedesc += f' {removecommit["subject"]}'
+            ms.set_window(lines + [commitline, blamedesc, removedesc, removeddesc])
+
+        exiting = False
+
+        async def loader() -> None:
+            nonlocal screen_dirty
+
+            while len(commits) < len(objects):
+                maybe_rerender()
+                if exiting:
+                    return
+                nextsha = objects[-1 - len(commits)]
+                ms.set_line(f'git log -1 {nextsha}')
+                commits[nextsha] = await git_get_commit(nextsha)
+                ms.set_line("")
+            while len(filediffstats) < len(objects):
+                maybe_rerender()
+                if exiting:
+                    return
                 nextsha = objects[-1 - len(filediffstats)]
                 ms.set_line(f'git show --numstat {nextsha}')
-                filediffstats[nextsha] = git_show_numstat(nextsha)
+                filediffstats[nextsha] = await git_show_numstat(nextsha)
                 for filename in filediffstats[nextsha]:
                     ms.set_line(f'git blame {nextsha} -- {filename}')
-                    blame_lines = git_blame(nextsha, filename)
+                    blame_lines = await git_blame(nextsha, filename)
+                    if filename in file_blames:
+                        prevsha, prev_blame_lines = file_blames[filename][-1]
+                        for line_source, contents in sorted(set(blame_lines) - set(prev_blame_lines)):
+                            # Skip if line only contains delimiters and whitespace
+                            if not contents.strip(b" \t\n\r<>(){}[],;"):
+                                continue
+                            blamesha, blamefile, blameline = line_source
+                            if prevsha == objects[current[0]]:
+                                screen_dirty = True
+                            commit_lines_removed[prevsha].setdefault(
+                                blamefile, []
+                            ).append(blamesha)
+
                     file_blames.setdefault(filename, []).append((nextsha, blame_lines))
                     childsha = file_to_commits[filename][-1] if filename in file_to_commits else None
                     file_to_commits.setdefault(filename, []).append(nextsha)
@@ -265,54 +400,13 @@ def main() -> None:
                             blamefile, {}
                         ).setdefault(blameline, childsha)
                 ms.set_line("")
-            if current[1] == 0:
-                added, removed = sum_diffstats(filediffstats[sha])
-                if len(filediffstats[sha]) == 1:
-                    currentfilename, = filediffstats[sha].keys()
-                    filedesc = f"1 file: {currentfilename}"
-                else:
-                    filedesc = f'{len(filediffstats[sha])} files'
-                blamedesc = f'{indent} {added} lines added, {removed} lines removed in {filedesc}'
-                removestats = collections.Counter(
-                    commit_lines_remove[sha][file][line]
-                    for file in commit_lines_remove[sha]
-                    for line in commit_lines_remove[sha][file]
-                )
-            else:
-                currentfilename, (added, removed) = list(filediffstats[sha].items())[
-                    current[1] - 1
-                ]
-                blamedesc = f'{indent} {added} lines added, {removed} lines removed in {currentfilename}'
-                removestats = collections.Counter(
-                    commit_lines_remove[sha][currentfilename][line]
-                    for line in commit_lines_remove[sha][currentfilename]
-                )
-            if not removestats and not added:
-                removedesc = f'{indent} No lines added'
-            elif not removestats:
-                removedesc = f"{indent} No interesting lines added"
-            else:
-                maxremove = max(removestats.keys(), key=lambda k: removestats[k])
-                totalremove = sum(removestats.values())
-                if removestats[maxremove] == totalremove:
-                    removepercent = "All lines"
-                elif totalremove > 200:
-                    removepercent = f'{removestats[maxremove]/totalremove:.1%} of lines'
-                else:
-                    removepercent = f'{removestats[maxremove]} of {totalremove} lines'
-                if maxremove is None:
-                    removedesc = f'{indent} {removepercent} are still alive'
-                else:
-                    try:
-                        removecommit = commits[maxremove]
-                    except KeyError:
-                        ms.set_line(f'git log -1 {maxremove}')
-                        removecommit = commits[maxremove] = git_get_commit(maxremove)
-                        ms.set_line("")
-                    removecommit = commits[maxremove]
-                    removedesc = f'{indent} {removepercent} are removed in commit {maxremove[:shalen]} {removecommit["subject"]}'
-            ms.set_window(lines + [commitline, blamedesc, removedesc])
-            s = read_one_keystroke(timeout=None)
+            maybe_rerender()
+
+        loader_task = asyncio.create_task(loader())
+
+        while True:
+            maybe_rerender()
+            s = await next_keystroke()
             if s in ("CTRL-D", "CTRL-C"):
                 break
             if s == "uparrow":
@@ -330,7 +424,12 @@ def main() -> None:
             elif s == "leftarrow":
                 current = current[0], max(0, current[1] - 1)
             elif s == "rightarrow":
-                current = current[0], min(len(filediffstats[sha]), current[1] + 1)
+                current = current[0], min(len(filediffstats[objects[current[0]]]), current[1] + 1)
+            else:
+                continue
+            screen_dirty = True
+        exiting = True
+        await loader_task
 
 
 if __name__ == "__main__":
