@@ -5,11 +5,13 @@ import subprocess
 from typing import TypedDict
 
 from miniscreen import MiniScreen, read_one_keystroke
-from miniscreen.futures import next_keystroke, check_output, create_task, run_coroutine
+from miniscreen.minifutures import next_keystroke, check_output, create_task, run_coroutine
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("revision_range")
+
+git_executable = "/usr/bin/git"
 
 
 class Commit(TypedDict):
@@ -26,7 +28,7 @@ class Commit(TypedDict):
 
 
 async def git_cat_file(sha: str) -> tuple[str, bytes]:
-    d = await check_output(("git", "cat-file", "--batch"), input=sha.encode())
+    d = await check_output((git_executable, "cat-file", "--batch"), input=sha.encode())
     first_line, nl, rest = d.partition(b"\n")
     assert nl
     oid, type, size_str = first_line.decode().split()
@@ -102,7 +104,7 @@ class Blame(TypedDict):
 async def sha_has_filename(sha: str, filename: str) -> bool:
     try:
         await check_output(
-            ("git", "rev-parse", "--quiet", "--verify", f"{sha}:{filename}")
+            (git_executable, "rev-parse", "--quiet", "--verify", f"{sha}:{filename}")
         )
     except subprocess.CalledProcessError:
         return False
@@ -111,7 +113,7 @@ async def sha_has_filename(sha: str, filename: str) -> bool:
 
 async def git_show_numstat(sha: str) -> dict[str, DiffStat]:
     numstat = await check_output(
-        ("git", "show", "--format=", "--numstat", sha),
+        (git_executable, "show", "--format=", "--numstat", sha),
     )
     filediffstat: dict[str, DiffStat] = {}
     if not numstat.strip(b"\n"):
@@ -127,28 +129,31 @@ async def git_blame(sha: str, filename: str) -> list[tuple[LineSource, bytes]]:
     if not (await sha_has_filename(sha, filename)):
         return []
     blame_b = await check_output(
-        ("git", "blame", "--porcelain", sha, "--", filename),
+        (git_executable, "blame", "--porcelain", sha, "--", filename),
     )
     if not blame_b.strip(b"\n"):
         return []
     blame_output_lines = iter(blame_b.strip(b"\n").split(b"\n"))
     lines: list[tuple[LineSource, bytes]] = []
-    linedata_for_sha: dict[bytes, dict[bytes, bytes]] = {}
+    linedata_for_sha: dict[bytes, dict[bytes, bytes | None]] = {}
     for lineno, headerline in enumerate(blame_output_lines, 1):
         assert headerline.count(b" ") >= 2, headerline
         blamesha, blameline, finalline, *_ignore = headerline.split(b" ", 3)
-        linedata: dict[bytes, bytes] = {}
+        linedata: dict[bytes, bytes | None] = {}
         for extraline in blame_output_lines:
             if extraline.startswith(b"\t"):
                 contents = extraline[1:] + b"\n"
                 break
             k_b, sep_b, v_b = extraline.partition(b" ")
-            assert sep_b
-            linedata[k_b] = v_b
+            if sep_b:
+                linedata[k_b] = v_b
+            else:
+                linedata[k_b] = None
         else:
             raise Exception("Unexpected EOF in git blame")
         if b"filename" in linedata:
             blamefile = linedata[b"filename"]
+            assert blamefile is not None
             linedata_for_sha[blamesha] = linedata
         else:
             assert blamesha in linedata_for_sha, (
@@ -159,6 +164,7 @@ async def git_blame(sha: str, filename: str) -> list[tuple[LineSource, bytes]]:
                 linedata,
             )
             blamefile = linedata_for_sha[blamesha][b"filename"]
+            assert blamefile is not None
         lines.append(((blamesha.decode(), blamefile.decode(), int(blameline)), contents))
     return lines
 
@@ -178,26 +184,16 @@ def main() -> None:
 
 
 async def async_main(revision_range: str) -> None:
-    rev_list_output = await check_output(
-        ("git", "rev-list", "--stdin"),
-        input=revision_range.encode(),
-    )
-    objects = rev_list_output.decode().split()[::-1]
+    objects: list[str] = []
     filediffstats: dict[str, dict[str, DiffStat]] = {}
     file_to_commits: dict[str, list[str]] = {}
     # [sha1][file][sha2] is a set of line numbers of sha1:file
     # that are present in sha2
-    commit_commit_lines: dict[str, dict[str, dict[str, set[int]]]] = {
-        o: {} for o in objects
-    }
+    commit_commit_lines: dict[str, dict[str, dict[str, set[int]]]] = {}
     # [sha1][file][line] is the sha2 that removes the line
-    commit_lines_remove: dict[str, dict[str, dict[int, str | None]]] = {
-        o: {} for o in objects
-    }
+    commit_lines_remove: dict[str, dict[str, dict[int, str | None]]] = {}
     # [sha1][file] is the list of sha2 that the deleted lines are added in
-    commit_lines_removed: dict[str, dict[str, list[str]]] = {
-        o: {} for o in objects
-    }
+    commit_lines_removed: dict[str, dict[str, list[str]]] = {}
     commitlistheight = 30
     commits: dict[str, Commit] = {}
     file_blames: dict[str, list[tuple[str, list[tuple[LineSource, bytes]]]]] = {}
@@ -214,6 +210,10 @@ async def async_main(revision_range: str) -> None:
 
         def render():
             nonlocal screen_dirty
+
+            if not objects:
+                screen_dirty = True
+                return
 
             screen_dirty = False
             lines = []
@@ -332,8 +332,21 @@ async def async_main(revision_range: str) -> None:
         exiting = False
 
         async def loader() -> None:
-            nonlocal screen_dirty
+            nonlocal screen_dirty, current
 
+            rev_list_output = await check_output(
+                (git_executable, "rev-list", "--stdin"),
+                input=revision_range.encode(),
+            )
+            objects[:] = rev_list_output.decode().split()[::-1]
+            for o in objects:
+                commit_commit_lines[o] = {}
+                commit_lines_remove[o] = {}
+                commit_lines_removed[o] = {}
+            current = len(objects) - 1, 0
+            maybe_rerender()
+            if exiting:
+                return
             while len(commits) < len(objects):
                 maybe_rerender()
                 if exiting:
