@@ -1,31 +1,15 @@
 import argparse
-import asyncio
 import collections
 import datetime
 import subprocess
 from typing import TypedDict
 
 from miniscreen import MiniScreen, read_one_keystroke
-from miniscreen.futures import next_keystroke
+from miniscreen.futures import next_keystroke, check_output, create_task, run_coroutine
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("revision_range")
-
-
-async def check_output(cmdline: tuple[str, ...], *, input: bytes | None = None) -> bytes:
-    proc = await asyncio.create_subprocess_exec(
-        *cmdline,
-        stdin=None if input is None else subprocess.PIPE,
-        stdout=subprocess.PIPE,
-    )
-    stdout_data, stderr_data = await proc.communicate(input)
-    assert stdout_data is not None
-    assert stderr_data is None
-    r = await proc.wait()
-    if r:
-        raise subprocess.CalledProcessError(r, cmdline, stdout_data, stderr_data)
-    return stdout_data
 
 
 class Commit(TypedDict):
@@ -190,7 +174,7 @@ def sum_diffstats(filediffstat: dict[str, DiffStat]) -> DiffStat:
 
 def main() -> None:
     args = parser.parse_args()
-    asyncio.run(async_main(args.revision_range))
+    run_coroutine(async_main(args.revision_range))
 
 
 async def async_main(revision_range: str) -> None:
@@ -402,7 +386,7 @@ async def async_main(revision_range: str) -> None:
                 ms.set_line("")
             maybe_rerender()
 
-        loader_task = asyncio.create_task(loader())
+        loader_task = create_task(loader())
 
         while True:
             maybe_rerender()
